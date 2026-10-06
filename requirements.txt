@@ -1,4 +1,4 @@
-# Install CPU-only torch/torchvision first; see README.md.
+
 torch>=2.6,<3
 torchvision>=0.21,<1
 transformers==4.57.1
