@@ -30,12 +30,36 @@ python scripts/fetch_data.py --extract-zip
 ```
 
 Downloads resume and completed files are skipped when rerun. `--retries 2` retries
-a failed folder transfer. `--output` changes the destination (default `data/raw`);
+transient transfer failures per file. Public-link retrieval errors stop that file
+without repeated requests. `--output` changes the destination (default `data/raw`);
 a category download adds its category directory. `--url` accepts a different
 public Drive folder. Drive must permit public downloads; quota or permission
 errors return a nonzero exit code. ZIP extraction is explicit and rejects paths
 outside the extraction directory. Other archives must be extracted separately.
 Documents are downloaded as supporting material and are not benchmark inputs.
+
+If a file cannot be retrieved, the script prints its exact filename and browser
+link and writes successful files and failures to `download_receipt.json` in the
+output directory. The folder-discovery messages do not mean files were downloaded.
+Try the failed file's browser link: if downloading it fails there too, check the
+file's sharing/download permissions or wait for Drive quota recovery. A public
+folder listing does not guarantee every file is downloadable.
+
+To fetch the remaining accessible files while recording failures:
+
+```bash
+python scripts/fetch_data.py --extract-zip --continue-on-error
+```
+
+This still returns exit code 1 when any file fails. Rerunning resumes transfers
+and skips completed files. Each successfully downloaded ZIP is extracted even
+when another file fails. For a smaller retry, select a category with `--category`.
+
+If downloads work only while signed in and you have already configured gdown's
+`~/.cache/gdown/cookies.txt`, opt in with `--use-cookies`. The default is anonymous;
+the script does not import browser cookies. See the [gdown FAQ](https://github.com/wkentaro/gdown#faq)
+for authentication options for your installed version. Keep session cookies
+private and outside this repository.
 
 Create an image manifest, optionally sampling videos at one frame every five
 seconds, at most 32 frames per video:

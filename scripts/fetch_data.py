@@ -26,6 +26,48 @@ CATEGORY_FOLDERS = {
 }
 
 
+def download_entry(
+    gdown, entry, *, use_cookies: bool, speed: float | None, retries: int
+) -> str:
+    """Download one listed file, preserving completed and partial transfers."""
+    destination = Path(entry.local_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Google-native documents have no extension in the folder listing. Let
+    # gdown resolve their exported filename from the response headers.
+    download_output = (
+        str(destination) if destination.suffix else str(destination.parent) + os.sep
+    )
+    for attempt in range(retries + 1):
+        try:
+            result = gdown.download(
+                id=entry.id,
+                output=download_output,
+                resume=True,
+                use_cookies=use_cookies,
+                speed=speed,
+            )
+            if result is None:
+                raise gdown.DownloadError(
+                    "No file returned; install gdown==6.1.1 and retry"
+                )
+            return str(result)
+        except gdown.FileURLRetrievalError:
+            # Repeated requests do not repair permissions or a quota block.
+            raise
+        except (gdown.DownloadError, OSError):
+            if attempt == retries:
+                raise
+            time.sleep(min(2**attempt, 10))
+    raise RuntimeError("No download attempt made")
+
+
+def write_receipt(output: Path, receipt: dict) -> None:
+    path = output / "download_receipt.json"
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(receipt, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
 def extract_zip(archive: Path) -> Path:
     """Extract beside the archive, rejecting links and paths outside that folder."""
     destination = archive.with_suffix("")
@@ -66,7 +108,20 @@ def main(argv: list[str] | None = None) -> int:
         "--speed-mbps", type=float, help="Per-file download cap in megabits/second"
     )
     parser.add_argument(
-        "--retries", type=int, default=2, help="Retries for a failed folder download"
+        "--retries",
+        type=int,
+        default=2,
+        help="Retries per file for transient transfer failures",
+    )
+    parser.add_argument(
+        "--use-cookies",
+        action="store_true",
+        help="Opt in to gdown's existing ~/.cache/gdown/cookies.txt; no browser cookies are imported",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Try remaining files after a failure; still return exit code 1 for an incomplete download",
     )
     parser.add_argument(
         "--extract-zip",
@@ -104,40 +159,89 @@ def main(argv: list[str] | None = None) -> int:
         "url": url,
         "output": str(output) + os.sep,
         "resume": True,
-        "use_cookies": False,
+        "use_cookies": args.use_cookies,
         "speed": args.speed_mbps * 1_000_000 / 8 if args.speed_mbps else None,
     }
     try:
+        entries = gdown.download_folder(**options, skip_download=True, quiet=True)
         if args.list_only:
-            files = gdown.download_folder(**options, skip_download=True, quiet=True)
-            for entry in files:
+            for entry in entries:
                 print(entry.local_path)
-            print(f"{len(files)} files; no dataset files downloaded.")
+            print(f"{len(entries)} files; no dataset files downloaded.")
             return 0
         output.mkdir(parents=True, exist_ok=True)
-        for attempt in range(args.retries + 1):
-            try:
-                files = gdown.download_folder(**options)
-                break
-            except gdown.DownloadError:
-                if attempt == args.retries:
-                    raise
-                time.sleep(min(2**attempt, 10))
-        extracted = [
-            str(extract_zip(Path(file)))
-            for file in files
-            if args.extract_zip and Path(file).suffix.lower() == ".zip"
-        ]
         receipt = {
             "source": url,
             "downloaded_at": datetime.now(timezone.utc).isoformat(),
-            "files": files,
-            "extracted_directories": extracted,
+            "status": "in_progress",
+            "listed_files": len(entries),
+            "files": [],
+            "failures": [],
+            "extracted_directories": [],
         }
-        (output / "download_receipt.json").write_text(
-            json.dumps(receipt, indent=2), encoding="utf-8"
+        try:
+            for index, entry in enumerate(entries, start=1):
+                browser_url = f"https://drive.google.com/file/d/{entry.id}/view"
+                print(
+                    f"[{index}/{len(entries)}] Downloading: {entry.path}\n  {browser_url}",
+                    flush=True,
+                )
+                try:
+                    file = download_entry(
+                        gdown,
+                        entry,
+                        use_cookies=args.use_cookies,
+                        speed=options["speed"],
+                        retries=args.retries,
+                    )
+                    receipt["files"].append(file)
+                    if args.extract_zip and Path(file).suffix.lower() == ".zip":
+                        receipt["extracted_directories"].append(
+                            str(extract_zip(Path(file)))
+                        )
+                except (
+                    gdown.DownloadError,
+                    ValueError,
+                    OSError,
+                    zipfile.BadZipFile,
+                ) as exc:
+                    receipt["failures"].append(
+                        {
+                            "id": entry.id,
+                            "path": entry.path,
+                            "url": browser_url,
+                            "error": str(exc),
+                        }
+                    )
+                    print(
+                        f"Failed: {entry.path}\n  Open in browser: {browser_url}\n  {exc}",
+                        file=sys.stderr,
+                    )
+                    if not args.continue_on_error:
+                        break
+            receipt["status"] = "partial" if receipt["failures"] else "complete"
+        except KeyboardInterrupt:
+            receipt["status"] = "interrupted"
+            print(
+                "Download interrupted; rerun the same command to resume.",
+                file=sys.stderr,
+            )
+            return 130
+        finally:
+            write_receipt(output, receipt)
+        print(
+            f"Downloaded/resumed {len(receipt['files'])} of {len(entries)} files into {output}"
         )
-        print(f"Downloaded/resumed {len(files)} files into {output}")
+        if receipt["failures"]:
+            print(
+                f"{len(receipt['failures'])} failed file(s); see {output / 'download_receipt.json'}.\n"
+                "Open the failed file's browser link and try downloading it. If that also fails, "
+                "check its sharing/download permissions or wait for Drive's quota to recover.\n"
+                "If it works only when signed in and you already configured gdown's cookie cache, "
+                "retry with --use-cookies. Use --continue-on-error to attempt the remaining files.",
+                file=sys.stderr,
+            )
+            return 1
         return 0
     except (gdown.DownloadError, ValueError, OSError, zipfile.BadZipFile) as exc:
         print(

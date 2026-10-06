@@ -223,10 +223,15 @@ class FetchTests(unittest.TestCase):
                 fetch_data.CATEGORY_FOLDERS["unattended_items"], options["url"]
             )
 
-    def test_retry_reuses_partial_downloads(self):
+    def test_retry_reuses_partial_downloads_per_file(self):
+        class LinkError(RuntimeError):
+            pass
+
         fake = types.SimpleNamespace(
-            download_folder=Mock(side_effect=[RuntimeError("network failed"), []]),
+            download_folder=Mock(),
+            download=Mock(),
             DownloadError=RuntimeError,
+            FileURLRetrievalError=LinkError,
         )
         with (
             tempfile.TemporaryDirectory() as temp,
@@ -234,9 +239,151 @@ class FetchTests(unittest.TestCase):
             patch("scripts.fetch_data.time.sleep"),
             redirect_stdout(io.StringIO()),
         ):
+            destination = Path(temp) / "dataset/image.jpg"
+            fake.download_folder.return_value = [
+                types.SimpleNamespace(
+                    id="file-id", path="image.jpg", local_path=str(destination)
+                )
+            ]
+            fake.download.side_effect = [
+                RuntimeError("network failed"),
+                str(destination),
+            ]
             self.assertEqual(fetch_data.main(["--output", temp, "--retries", "1"]), 0)
-            self.assertEqual(fake.download_folder.call_count, 2)
-            self.assertTrue((Path(temp) / "download_receipt.json").is_file())
+            self.assertEqual(fake.download_folder.call_count, 1)
+            self.assertEqual(fake.download.call_count, 2)
+            self.assertTrue(fake.download.call_args.kwargs["resume"])
+            self.assertFalse(fake.download.call_args.kwargs["use_cookies"])
+            receipt = json.loads((Path(temp) / "download_receipt.json").read_text())
+            self.assertEqual(receipt["status"], "complete")
+            self.assertEqual(receipt["files"], [str(destination)])
+
+    def test_public_link_failure_is_not_retried_and_identifies_file(self):
+        class LinkError(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            entries = [
+                types.SimpleNamespace(
+                    id="blocked-id",
+                    path="01.avi",
+                    local_path=str(Path(temp) / "01.avi"),
+                ),
+                types.SimpleNamespace(
+                    id="next-id", path="02.avi", local_path=str(Path(temp) / "02.avi")
+                ),
+            ]
+            fake = types.SimpleNamespace(
+                download_folder=Mock(return_value=entries),
+                download=Mock(side_effect=LinkError("Cannot retrieve public link")),
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=LinkError,
+            )
+            error_output = io.StringIO()
+            with (
+                patch.dict("sys.modules", {"gdown": fake}),
+                patch("scripts.fetch_data.time.sleep") as sleep,
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(error_output),
+            ):
+                self.assertEqual(fetch_data.main(["--output", temp]), 1)
+            fake.download.assert_called_once()
+            sleep.assert_not_called()
+            self.assertIn("01.avi", error_output.getvalue())
+            self.assertIn(
+                "https://drive.google.com/file/d/blocked-id/view",
+                error_output.getvalue(),
+            )
+            receipt = json.loads((Path(temp) / "download_receipt.json").read_text())
+            self.assertEqual(receipt["status"], "partial")
+            self.assertEqual(receipt["failures"][0]["id"], "blocked-id")
+            self.assertEqual(receipt["listed_files"], 2)
+
+    def test_continue_on_error_downloads_and_extracts_remaining_files(self):
+        class LinkError(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            archive = Path(temp) / "dataset.zip"
+            with zipfile.ZipFile(archive, "w") as handle:
+                handle.writestr("train/one.jpg", "image contents")
+            entries = [
+                types.SimpleNamespace(
+                    id="blocked-id",
+                    path="01.avi",
+                    local_path=str(Path(temp) / "01.avi"),
+                ),
+                types.SimpleNamespace(
+                    id="archive-id", path="dataset.zip", local_path=str(archive)
+                ),
+            ]
+            fake = types.SimpleNamespace(
+                download_folder=Mock(return_value=entries),
+                download=Mock(
+                    side_effect=[LinkError("Cannot retrieve public link"), str(archive)]
+                ),
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=LinkError,
+            )
+            with (
+                patch.dict("sys.modules", {"gdown": fake}),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(
+                    fetch_data.main(
+                        [
+                            "--output",
+                            temp,
+                            "--continue-on-error",
+                            "--extract-zip",
+                            "--use-cookies",
+                        ]
+                    ),
+                    1,
+                )
+            self.assertEqual(fake.download.call_count, 2)
+            self.assertTrue(fake.download.call_args.kwargs["use_cookies"])
+            self.assertTrue(fake.download_folder.call_args.kwargs["use_cookies"])
+            self.assertEqual(
+                (Path(temp) / "dataset/train/one.jpg").read_text(), "image contents"
+            )
+            receipt = json.loads((Path(temp) / "download_receipt.json").read_text())
+            self.assertEqual(receipt["files"], [str(archive)])
+            self.assertEqual(len(receipt["failures"]), 1)
+            self.assertEqual(
+                receipt["extracted_directories"], [str(Path(temp) / "dataset")]
+            )
+
+    def test_interruption_preserves_receipt(self):
+        class LinkError(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            first = str(Path(temp) / "01.jpg")
+            entries = [
+                types.SimpleNamespace(
+                    id=str(index),
+                    path=f"{index}.jpg",
+                    local_path=str(Path(temp) / f"{index}.jpg"),
+                )
+                for index in range(2)
+            ]
+            fake = types.SimpleNamespace(
+                download_folder=Mock(return_value=entries),
+                download=Mock(side_effect=[first, KeyboardInterrupt]),
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=LinkError,
+            )
+            with (
+                patch.dict("sys.modules", {"gdown": fake}),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(fetch_data.main(["--output", temp]), 130)
+            receipt = json.loads((Path(temp) / "download_receipt.json").read_text())
+            self.assertEqual(receipt["status"], "interrupted")
+            self.assertEqual(receipt["files"], [first])
 
     def test_zip_traversal_and_symlinks_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
