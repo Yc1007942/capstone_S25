@@ -29,7 +29,9 @@ python scripts/fetch_data.py --category smoking --extract-zip --speed-mbps 20
 python scripts/fetch_data.py --extract-zip
 ```
 
-Downloads resume and completed files are skipped when rerun. `--retries 2` retries
+Downloads resume and completed files are skipped locally before any file-download
+request, including valid empty annotation files. Incomplete `.part` files are
+resumed by gdown. `--retries 2` retries
 transient transfer failures per file. Public-link retrieval errors stop that file
 without repeated requests. `--output` changes the destination (default `data/raw`);
 a category download adds its category directory. `--url` accepts a different
@@ -51,15 +53,67 @@ To fetch the remaining accessible files while recording failures:
 python scripts/fetch_data.py --extract-zip --continue-on-error
 ```
 
-This still returns exit code 1 when any file fails. Rerunning resumes transfers
-and skips completed files. Each successfully downloaded ZIP is extracted even
-when another file fails. For a smaller retry, select a category with `--category`.
+This still returns exit code 1 when any file fails. It continues past individual
+failures but stops after five consecutive failed download requests. Continuing
+through thousands of blocked requests does not fix Drive access. Use
+`--max-consecutive-errors 0` only if you deliberately want to disable that stop.
+`--request-interval 1` spaces file-download attempts by at least one second (the
+default); it does not guarantee that Google will allow the requests. gdown may
+make several HTTP requests inside an attempt. `--speed-mbps` limits bandwidth,
+which is separate from request pacing.
 
-If downloads work only while signed in and you have already configured gdown's
-`~/.cache/gdown/cookies.txt`, opt in with `--use-cookies`. The default is anonymous;
-the script does not import browser cookies. See the [gdown FAQ](https://github.com/wkentaro/gdown#faq)
-for authentication options for your installed version. Keep session cookies
-private and outside this repository.
+Rerunning resumes transfers and skips completed files. Each successfully
+downloaded ZIP is extracted even when another file fails. For a smaller retry,
+select a category with `--category`. To reduce thousands of file transfers to an
+archive download for an initial smoking experiment, keep the same output directory:
+
+```bash
+python scripts/fetch_data.py --include "*smoking_cctv_image.v1i.coco.zip" --extract-zip
+```
+
+`--include` accepts case-insensitive glob patterns against relative paths, with
+Windows and Unix separators normalized. Repeat it to include more patterns.
+For image-only inference, `--include "*.jpg" --include "*.png"` excludes the
+individual annotation text files. Files under YOLO `labels/` contain one object
+per row as `class x_center y_center width height`, with coordinates normalized
+to the image dimensions. Their class IDs must be interpreted using the dataset's
+class-name mapping, typically in `data.yaml`; a class ID alone does not identify
+one of this project's anomalies. Retain these annotations for detection evaluation.
+The current image-classification benchmark uses reviewed CSV labels and does not
+automatically import YOLO box annotations.
+For datasets available only as loose files, you can instead download their folder
+as a ZIP in the Drive browser or ask the owner to provide an archive. gdown's
+individual-file route still needs a public or authenticated download for each file.
+
+If a file downloads in your signed-in browser while anonymous gdown fails, use
+your own account's cookies. Upgrade the download dependency first:
+
+```bash
+python -m pip install --upgrade gdown==6.4.1
+```
+
+When Firefox is installed and signed into the account that can download the file,
+this diagnostic resolves one failing file and imports Google's cookies into
+gdown's cache without downloading the dataset:
+
+```bash
+python -m gdown --cookies-from-browser firefox --json "https://drive.google.com/uc?id=1yk_c6oEfVlhLGqinmutIK4RjpvF55egR"
+python scripts/fetch_data.py --extract-zip --continue-on-error --use-cookies
+```
+
+On Windows, current Chrome cookies may not be decryptable by gdown; the
+[gdown FAQ](https://github.com/wkentaro/gdown#faq) recommends Firefox. Alternatively,
+export your own Google cookies in Netscape format and provide their existing path:
+
+```bash
+python scripts/fetch_data.py --extract-zip --continue-on-error --cookies-file /path/to/cookies.txt
+```
+
+The script imports no browser cookies automatically. Cookie use is explicit;
+`--cookies-file` enables it for the supplied file, while `--use-cookies` loads
+the default `~/.cache/gdown/cookies.txt`. These files contain session credentials:
+keep them private and outside this repository. Authentication and pacing do not
+override a file owner's download restrictions or an exhausted download quota.
 
 Create an image manifest, optionally sampling videos at one frame every five
 seconds, at most 32 frames per video:

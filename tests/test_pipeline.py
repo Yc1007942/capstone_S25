@@ -342,7 +342,9 @@ class FetchTests(unittest.TestCase):
                     ),
                     1,
                 )
-            self.assertEqual(fake.download.call_count, 2)
+            # The ZIP already exists locally; it must be extracted without a
+            # second request to Drive, even after a preceding access failure.
+            self.assertEqual(fake.download.call_count, 1)
             self.assertTrue(fake.download.call_args.kwargs["use_cookies"])
             self.assertTrue(fake.download_folder.call_args.kwargs["use_cookies"])
             self.assertEqual(
@@ -384,6 +386,186 @@ class FetchTests(unittest.TestCase):
             receipt = json.loads((Path(temp) / "download_receipt.json").read_text())
             self.assertEqual(receipt["status"], "interrupted")
             self.assertEqual(receipt["files"], [first])
+
+    def test_existing_empty_annotation_skips_drive_entirely(self):
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "label.txt"
+            destination.touch()
+            entry = types.SimpleNamespace(
+                id="id", path="label.txt", local_path=str(destination)
+            )
+            fake = types.SimpleNamespace(
+                download=Mock(side_effect=AssertionError("No network request expected"))
+            )
+            pacer = Mock()
+            result = fetch_data.download_entry(
+                fake, entry, use_cookies=False, speed=None, retries=2, pacer=pacer
+            )
+            self.assertEqual(result, str(destination))
+            fake.download.assert_not_called()
+            pacer.wait.assert_not_called()
+
+    def test_partial_file_does_not_count_as_completed(self):
+        class LinkError(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            destination = Path(temp) / "image.jpg"
+            part = Path(temp) / "image.jpgrandom.part"
+            part.write_bytes(b"partial")
+            entry = types.SimpleNamespace(
+                id="id", path="image.jpg", local_path=str(destination)
+            )
+            fake = types.SimpleNamespace(
+                download=Mock(return_value=str(destination)),
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=LinkError,
+            )
+            self.assertEqual(
+                fetch_data.download_entry(
+                    fake, entry, use_cookies=False, speed=None, retries=0
+                ),
+                str(destination),
+            )
+            fake.download.assert_called_once()
+            self.assertTrue(fake.download.call_args.kwargs["resume"])
+            self.assertEqual(part.read_bytes(), b"partial")
+
+    def test_pacer_spaces_network_attempts(self):
+        pacer = fetch_data.DownloadPacer(1)
+        with (
+            patch("scripts.fetch_data.time.monotonic", side_effect=[0.0, 0.25, 1.0]),
+            patch("scripts.fetch_data.time.sleep") as sleep,
+        ):
+            pacer.wait()
+            pacer.wait()
+        sleep.assert_called_once_with(0.75)
+
+    def test_include_filter_handles_windows_paths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            entries = [
+                types.SimpleNamespace(
+                    path="smoking\\images\\image.jpg", local_path="image.jpg"
+                ),
+                types.SimpleNamespace(
+                    path="smoking\\archive.ZIP", local_path="archive.ZIP"
+                ),
+            ]
+            fake = types.SimpleNamespace(
+                download_folder=Mock(return_value=entries), DownloadError=RuntimeError
+            )
+            stdout = io.StringIO()
+            with patch.dict("sys.modules", {"gdown": fake}), redirect_stdout(stdout):
+                self.assertEqual(
+                    fetch_data.main(
+                        ["--output", temp, "--include", "smoking/*.zip", "--list-only"]
+                    ),
+                    0,
+                )
+            self.assertIn("archive.ZIP", stdout.getvalue())
+            self.assertNotIn("image.jpg", stdout.getvalue())
+            self.assertFalse((Path(temp) / "download_receipt.json").exists())
+
+    def test_repeated_failures_stop_even_with_continue_on_error(self):
+        class LinkError(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            entries = [
+                types.SimpleNamespace(
+                    id=str(index),
+                    path=f"{index}.txt",
+                    local_path=str(Path(temp) / f"{index}.txt"),
+                )
+                for index in range(4)
+            ]
+            # A local skip between two failed requests must not reset the
+            # consecutive network failure counter.
+            Path(entries[1].local_path).touch()
+            fake = types.SimpleNamespace(
+                download_folder=Mock(return_value=entries),
+                download=Mock(side_effect=LinkError("access blocked")),
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=LinkError,
+            )
+            with (
+                patch.dict("sys.modules", {"gdown": fake}),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(
+                    fetch_data.main(
+                        [
+                            "--output",
+                            temp,
+                            "--continue-on-error",
+                            "--max-consecutive-errors",
+                            "2",
+                            "--request-interval",
+                            "0",
+                        ]
+                    ),
+                    1,
+                )
+            self.assertEqual(fake.download.call_count, 2)
+            receipt = json.loads((Path(temp) / "download_receipt.json").read_text())
+            self.assertEqual(receipt["skipped_existing"], 1)
+            self.assertEqual(
+                receipt["stopped_reason"], "2 consecutive downloads failed"
+            )
+            self.assertEqual(len(receipt["failures"]), 2)
+
+    def test_explicit_cookie_file_is_forwarded(self):
+        class LinkError(RuntimeError):
+            pass
+
+        with tempfile.TemporaryDirectory() as temp:
+            cookie_file = Path(temp) / "cookies.txt"
+            cookie_file.write_text("# Netscape HTTP Cookie File\n")
+            destination = Path(temp) / "image.jpg"
+            entry = types.SimpleNamespace(
+                id="id", path="image.jpg", local_path=str(destination)
+            )
+            calls = []
+
+            def download(*, cookies_file=None, **options):
+                calls.append({"cookies_file": cookies_file, **options})
+                return str(destination)
+
+            fake = types.SimpleNamespace(
+                download_folder=Mock(return_value=[entry]),
+                download=download,
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=LinkError,
+            )
+            with (
+                patch.dict("sys.modules", {"gdown": fake}),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    fetch_data.main(
+                        ["--output", temp, "--cookies-file", str(cookie_file)]
+                    ),
+                    0,
+                )
+            self.assertEqual(calls[0]["cookies_file"], str(cookie_file))
+            self.assertTrue(calls[0]["use_cookies"])
+            self.assertEqual(
+                fake.download_folder.call_args.kwargs["cookies_file"], str(cookie_file)
+            )
+
+    def test_invalid_pacing_settings_fail_before_network(self):
+        for arguments in (
+            ["--request-interval", "nan"],
+            ["--request-interval", "-1"],
+            ["--max-consecutive-errors", "-1"],
+        ):
+            with (
+                self.subTest(arguments=arguments),
+                redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                fetch_data.main(arguments)
 
     def test_zip_traversal_and_symlinks_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

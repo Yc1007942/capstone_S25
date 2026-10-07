@@ -6,3 +6,5 @@ models/
 __pycache__/
 *.py[cod]
 .ruff_cache/
+cookies.txt
+cookies*.txt
