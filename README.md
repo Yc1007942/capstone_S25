@@ -61,6 +61,12 @@ through thousands of blocked requests does not fix Drive access. Use
 default); it does not guarantee that Google will allow the requests. gdown may
 make several HTTP requests inside an attempt. `--speed-mbps` limits bandwidth,
 which is separate from request pacing.
+The minimum interval is `0`, which disables the script's added delay; `0.01`
+means a minimum of 10 milliseconds between attempt starts. Transfers remain
+sequential, and an attempt that already takes longer than the interval adds no
+extra sleep. There is no guaranteed throttle-free interval for Drive. Start
+with the default one second after repeated failures and adjust based on successful
+downloads. Downloading a ZIP avoids thousands of individual-file requests.
 
 Rerunning resumes transfers and skips completed files. Each successfully
 downloaded ZIP is extracted even when another file fails. For a smaller retry,
@@ -100,6 +106,20 @@ gdown's cache without downloading the dataset:
 python -m gdown --cookies-from-browser firefox --json "https://drive.google.com/uc?id=1yk_c6oEfVlhLGqinmutIK4RjpvF55egR"
 python scripts/fetch_data.py --extract-zip --continue-on-error --use-cookies
 ```
+
+If a cookie-based folder listing returns no files, the script retries the listing
+without cookies and keeps cookies enabled for individual file downloads. To force
+this combination for the project's public folder:
+
+```bash
+python scripts/fetch_data.py --extract-zip --continue-on-error --use-cookies --anonymous-listing
+```
+
+An empty folder listing is reported separately from `--include` patterns that
+match no files. It occurs before download pacing, so changing `--request-interval`
+cannot fix it. Use `--list-only --anonymous-listing` to check discovery without
+downloading dataset files. An empty listing may indicate an empty/inaccessible
+folder or a Drive page that gdown cannot parse.
 
 On Windows, current Chrome cookies may not be decryptable by gdown; the
 [gdown FAQ](https://github.com/wkentaro/gdown#faq) recommends Firefox. Alternatively,
@@ -161,7 +181,7 @@ List models and run a small comparison:
 ```bash
 python scripts/benchmark.py --list-models
 python scripts/benchmark.py --manifest data/manifest.csv \
-  --models clip-vit-b32 smolvlm-256m --limit 20 --threads 2 --duty-cycle 0.5
+  --models mobileclip2-s2 siglip2-b16-224 smolvlm-500m --limit 20 --threads 2 --duty-cycle 1
 
 # Once reference images are labeled:
 python scripts/benchmark.py --manifest data/manifest.csv \
@@ -174,8 +194,11 @@ python scripts/benchmark.py --manifest data/manifest.csv --models all \
 
 | Model name | Approach | Reference images |
 | --- | --- | --- |
+| `mobileclip2-s2` | MobileCLIP2-S2, cached text features + image similarity | No |
+| `siglip2-b16-224` | SigLIP2-B/16-224, independent sigmoid image/text scores | No |
 | `clip-vit-b32`, `clip-vit-b16` | CLIP similarity to anomaly descriptions | No |
 | `smolvlm-256m`, `smolvlm-500m` | SmolVLM, deterministic JSON label generation | No |
+| `minicpm-v4` | MiniCPM-V 4.0, deterministic single-image chat | No |
 | `mobilenet-v3-small`, `resnet18` | Frozen timm features + nearest labeled reference | Every class |
 | `dinov2-small` | Frozen DINOv2 features + nearest labeled reference | Every class |
 
@@ -184,6 +207,68 @@ Model adapters follow the [CLIP API](https://huggingface.co/docs/transformers/v4
 [DINOv2 API](https://huggingface.co/docs/transformers/v4.57.1/model_doc/dinov2), and
 [timm feature extraction API](https://huggingface.co/docs/timm/feature_extraction).
 Add checkpoints/adapters in `scripts/models.py` to extend the comparison.
+
+The default comparison is now MobileCLIP2-S2, SigLIP2-B/16-224, and
+SmolVLM-500M; the 256M variant remains available as a smaller comparison. The MobileCLIP2 adapter uses the
+[OpenCLIP port of Apple's S2 weights](https://huggingface.co/timm/MobileCLIP2-S2-OpenCLIP)
+and fuses convolution branches before measuring inference. SigLIP2 uses
+lowercased descriptions, fixed 64-token text padding, and sigmoid scores, following
+the [SigLIP2 API](https://huggingface.co/docs/transformers/v4.57.1/model_doc/siglip2).
+Neither adapter needs reference images. All image models select one best category;
+SigLIP2 scores do not sum to one and need validation before being used as alert
+probabilities. Its numeric anomaly score is an anomaly-vs-normal logit margin.
+
+The larger VLM candidate is [MiniCPM-V 4.0](https://huggingface.co/openbmb/MiniCPM-V-4),
+with 4.1B parameters. Its float32 weights alone are approximately 16.4 GB before
+runtime buffers and image/token processing. The `minicpm-v4` adapter uses CPU
+float32, SDPA for the language model, one image slice, one decoding beam, and the
+same JSON classification prompt as SmolVLM. It loads the publisher's custom model
+and processor code through `trust_remote_code=True`. Run it separately with a
+memory budget; it is excluded from the small default comparison:
+
+```bash
+python scripts/benchmark.py --manifest data/manifest.csv --models minicpm-v4 \
+  --limit 10 --threads 8 --duty-cycle 1 --max-rss-mb 24576 --timeout-seconds 1800
+```
+
+24 GiB is a starting per-worker budget for a roughly 32 GiB deployment box; leave
+room for Windows, decoding, and other applications, and adjust after measuring.
+The [official GGUF weights](https://huggingface.co/openbmb/MiniCPM-V-4-gguf) offer a
+candidate for later quantized CPU deployment. This runner does not implement a
+GGUF runtime; evaluate that artifact's accuracy and end-to-end speed separately.
+MiniCPM-V 4.0 is the smaller 4.1B model, not the distinct 8B MiniCPM-V 4.5 model.
+
+CPU smoke checks passed with pretrained MobileCLIP2-S2, SigLIP2-B/16-224, and
+SmolVLM-500M on a synthetic image, including the benchmark's default comparison.
+MiniCPM's loading and chat path was checked with a reduced random-weight model;
+the full pretrained 4.1B model still needs a run on the deployment hardware.
+These checks establish execution, not anomaly accuracy or Ryzen throughput.
+
+The remaining shortlisted model requires video integration:
+
+- [VadCLIP](https://github.com/nwpu-zxr/VadCLIP) is a trained temporal video anomaly
+  detector. Its published UCF-Crime and XD-Violence checkpoints expect their
+  original feature pipeline and label setup. Our single-image runner does not
+  implement VadCLIP. A video benchmark must include feature extraction as well as
+  its temporal head; timings of precomputed features alone omit most pipeline work.
+
+`scripts/throttle.py` limits the current host's resource use and cannot emulate
+Ryzen AI Max+ 395 performance. Thread count and added sleep do not reproduce a
+different CPU's instruction throughput, cache, memory bandwidth, power budget,
+or integrated accelerators. The
+[Ryzen AI Max+ 395](https://www.amd.com/en/products/processors/laptop/ryzen/ai-300-series/amd-ryzen-ai-max-plus-395.html)
+has 16 CPU cores and 32 threads and a configurable power envelope. Benchmark on
+the actual deployment box with the intended OS, RAM configuration, power mode,
+runtime, and precision. This runner uses CPU only; its results do not measure the
+Radeon GPU or NPU. `run.json` records the host CPU description and total RAM.
+
+For capacity measurements, use `--duty-cycle 1` and omit
+`--max-samples-per-second`. On the target box, compare thread budgets such as
+4, 8, 16, and 32 with the same data and settings; more threads can add overhead,
+so select the measured setting that meets your throughput and tail-latency
+requirements. Then repeat at the camera sampling rate you plan to deploy, with
+decoding and other application work included. A thread sweep on a different PC
+measures that PC, not the Ryzen target.
 
 `--threads` limits PyTorch and numerical-library threads. `--duty-cycle 0.5`
 sleeps for the duration of each inference or reference operation; `1` disables
@@ -195,7 +280,8 @@ entire run, including downloads, loading, references, warmups, and sleeps.
 `--max-rss-mb` terminates workers that exceed the sampled RSS limit; it is not a
 hard OS memory reservation and brief spikes may be missed.
 
-All models use CPU float32 and eager attention. Input images are capped at 512
+All models use CPU float32. SmolVLM, CLIP, and the Transformers vision models use
+eager attention; MiniCPM uses its supported SDPA language-model path. Input images are capped at 512
 pixels on the longest edge by default; VLM output is capped at 32 new tokens.
 Small objects such as cigarettes may need higher resolution. First runs download
 weights; use `--cache-dir models` for a project-local cache and `--offline` after
@@ -218,8 +304,10 @@ inference. Each model gets a fresh process so memory from earlier models is free
 Accuracy, per-class precision/recall/F1, binary anomaly F1, confusion matrices, and
 ROC-AUC use verified test labels from the first repeat. `accuracy`, `macro_f1`,
 and binary metrics describe valid predictions; inspect `prediction_coverage` and
-`accuracy_including_failures` alongside them. VLM `unknown` or malformed replies
-are abstentions, never automatic normal predictions. CLIP scores are relative
+`accuracy_including_failures` alongside them. VLM `unknown` or ambiguous replies
+are abstentions. The parser accepts JSON and exact class names (optionally quoted
+with a final period), preserves the raw response, and does not find label words
+inside explanatory prose or assign normal to an invalid reply. CLIP scores are relative
 candidate weights, not calibrated probabilities; vision scores are cosine
 similarities and anomaly scores are the anomaly-vs-normal similarity margin.
 VLMs have no numeric anomaly score, so their ROC-AUC is unavailable. A failed model

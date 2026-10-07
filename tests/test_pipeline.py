@@ -192,6 +192,120 @@ class DataTests(unittest.TestCase):
 
 
 class FetchTests(unittest.TestCase):
+    def test_empty_cookie_listing_retries_anonymously_and_keeps_download_cookies(self):
+        with tempfile.TemporaryDirectory() as temp:
+            cookie_file = Path(temp) / "cookies.txt"
+            cookie_file.write_text("# Netscape HTTP Cookie File\n")
+            entry = types.SimpleNamespace(
+                id="id", path="image.jpg", local_path=str(Path(temp) / "image.jpg")
+            )
+            calls = []
+
+            def download(*, cookies_file=None, **options):
+                calls.append({"cookies_file": cookies_file, **options})
+                return entry.local_path
+
+            fake = types.SimpleNamespace(
+                download_folder=Mock(side_effect=[[], [entry]]),
+                download=download,
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=RuntimeError,
+            )
+            stderr = io.StringIO()
+            with (
+                patch.dict("sys.modules", {"gdown": fake}),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(stderr),
+            ):
+                self.assertEqual(
+                    fetch_data.main(
+                        ["--output", temp, "--cookies-file", str(cookie_file)]
+                    ),
+                    0,
+                )
+            self.assertIn("Retrying the public folder listing", stderr.getvalue())
+            first, second = fake.download_folder.call_args_list
+            self.assertTrue(first.kwargs["use_cookies"])
+            self.assertFalse(second.kwargs["use_cookies"])
+            self.assertNotIn("cookies_file", second.kwargs)
+            self.assertTrue(calls[0]["use_cookies"])
+            self.assertEqual(calls[0]["cookies_file"], str(cookie_file))
+            receipt = json.loads((Path(temp) / "download_receipt.json").read_text())
+            self.assertFalse(receipt["listing_use_cookies"])
+
+    def test_forced_anonymous_listing_preserves_authenticated_downloads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            entry = types.SimpleNamespace(
+                id="id", path="image.jpg", local_path=str(Path(temp) / "image.jpg")
+            )
+            fake = types.SimpleNamespace(
+                download_folder=Mock(return_value=[entry]),
+                download=Mock(return_value=entry.local_path),
+                DownloadError=RuntimeError,
+                FileURLRetrievalError=RuntimeError,
+            )
+            with (
+                patch.dict("sys.modules", {"gdown": fake}),
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    fetch_data.main(
+                        ["--output", temp, "--use-cookies", "--anonymous-listing"]
+                    ),
+                    0,
+                )
+            fake.download_folder.assert_called_once()
+            self.assertFalse(fake.download_folder.call_args.kwargs["use_cookies"])
+            self.assertTrue(fake.download.call_args.kwargs["use_cookies"])
+
+    def test_empty_listing_reports_discovery_failure_before_filtering(self):
+        for flags, expected_calls in (([], 1), (["--use-cookies"], 2)):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as temp:
+                output = Path(temp) / "absent"
+                fake = types.SimpleNamespace(
+                    download_folder=Mock(return_value=[]),
+                    download=Mock(),
+                    DownloadError=RuntimeError,
+                )
+                stderr = io.StringIO()
+                with (
+                    patch.dict("sys.modules", {"gdown": fake}),
+                    redirect_stdout(io.StringIO()),
+                    redirect_stderr(stderr),
+                ):
+                    self.assertEqual(
+                        fetch_data.main(
+                            ["--output", str(output), "--list-only", *flags]
+                        ),
+                        1,
+                    )
+                self.assertIn("empty folder listing", stderr.getvalue())
+                self.assertNotIn("none match --include", stderr.getvalue())
+                self.assertEqual(fake.download_folder.call_count, expected_calls)
+                fake.download.assert_not_called()
+                self.assertFalse(output.exists())
+
+    def test_unmatched_filter_does_not_retry_a_nonempty_listing(self):
+        fake = types.SimpleNamespace(
+            download_folder=Mock(
+                return_value=[types.SimpleNamespace(path="image.jpg")]
+            ),
+            DownloadError=RuntimeError,
+        )
+        stderr = io.StringIO()
+        with (
+            patch.dict("sys.modules", {"gdown": fake}),
+            redirect_stderr(stderr),
+        ):
+            self.assertEqual(
+                fetch_data.main(["--include", "*.zip", "--use-cookies", "--list-only"]),
+                1,
+            )
+        self.assertIn(
+            "Drive listed 1 files, but none match --include", stderr.getvalue()
+        )
+        fake.download_folder.assert_called_once()
+
     def test_list_only_is_read_only_and_category_is_resolved(self):
         fake = types.SimpleNamespace(
             download_folder=Mock(
@@ -592,6 +706,15 @@ class FetchTests(unittest.TestCase):
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_vlm_accepts_an_unambiguous_exact_label(self):
+        for response in ("normal", '"normal".', "'normal'.", '"normal"', "smoking."):
+            with self.subTest(response=response):
+                expected = "smoking" if response.startswith("smoking") else "normal"
+                self.assertEqual(
+                    parse_vlm_response(response, DEFINITIONS).label, expected
+                )
+        self.assertIsNone(parse_vlm_response("normal or smoking", DEFINITIONS).label)
+
     def test_vlm_abstains_on_ambiguous_or_invalid_output(self):
         for text in (
             '{"label":"unknown"}',

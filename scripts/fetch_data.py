@@ -160,6 +160,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Opt in to gdown's existing ~/.cache/gdown/cookies.txt; no browser cookies are imported",
     )
     parser.add_argument(
+        "--anonymous-listing",
+        action="store_true",
+        help="List a public folder without cookies; cookie settings still apply to file downloads",
+    )
+    parser.add_argument(
         "--cookies-file",
         type=Path,
         help="Explicit Netscape cookies file; enables cookie use (requires gdown 6.4.1)",
@@ -250,24 +255,53 @@ def main(argv: list[str] | None = None) -> int:
     if args.cookies_file:
         options["cookies_file"] = str(args.cookies_file)
     try:
-        entries = gdown.download_folder(**options, skip_download=True, quiet=True)
+        listing_options = options.copy()
+        if args.anonymous_listing:
+            listing_options["use_cookies"] = False
+            listing_options.pop("cookies_file", None)
+        entries = gdown.download_folder(
+            **listing_options, skip_download=True, quiet=True
+        )
+        if not entries and listing_options["use_cookies"]:
+            print(
+                "Drive returned no files when listing with cookies. "
+                "Retrying the public folder listing without cookies; "
+                "file downloads will still use your cookies.",
+                file=sys.stderr,
+                flush=True,
+            )
+            listing_options["use_cookies"] = False
+            listing_options.pop("cookies_file", None)
+            entries = gdown.download_folder(
+                **listing_options, skip_download=True, quiet=True
+            )
+        if not entries:
+            print(
+                f"Drive returned an empty folder listing: {url}\n"
+                "The folder may be empty, inaccessible, or its page could not be parsed by gdown. "
+                "Open the folder in your browser and confirm it contains files. "
+                "This happened before path filtering or downloading; "
+                "--include and --request-interval do not fix an empty listing.",
+                file=sys.stderr,
+            )
+            return 1
         available_files = len(entries)
         entries = (
             [entry for entry in entries if matches_patterns(entry.path, args.include)]
             if args.include
             else entries
         )
+        if not entries:
+            print(
+                f"Drive listed {available_files} files, but none match --include patterns: {args.include}",
+                file=sys.stderr,
+            )
+            return 1
         if args.list_only:
             for entry in entries:
                 print(entry.local_path)
             print(f"{len(entries)} files; no dataset files downloaded.")
             return 0
-        if not entries:
-            print(
-                "No files match the selected paths; check --include patterns.",
-                file=sys.stderr,
-            )
-            return 1
         output.mkdir(parents=True, exist_ok=True)
         receipt = {
             "source": url,
@@ -276,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
             "listed_files": len(entries),
             "available_files": available_files,
             "include": args.include,
+            "listing_use_cookies": listing_options["use_cookies"],
             "files": [],
             "failures": [],
             "extracted_directories": [],

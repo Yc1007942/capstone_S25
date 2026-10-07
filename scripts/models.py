@@ -15,9 +15,15 @@ from scripts.throttle import Throttler
 class ModelSpec:
     kind: str
     checkpoint: str
+    revision: str | None = None
 
 
 MODELS = {
+    "mobileclip2-s2": ModelSpec("openclip", "timm/MobileCLIP2-S2-OpenCLIP"),
+    "siglip2-b16-224": ModelSpec("siglip", "google/siglip2-base-patch16-224"),
+    "minicpm-v4": ModelSpec(
+        "minicpm", "openbmb/MiniCPM-V-4", "6f69a8235885be89608f3a71ffd40695b379e1e7"
+    ),
     "clip-vit-b32": ModelSpec("clip", "openai/clip-vit-base-patch32"),
     "clip-vit-b16": ModelSpec("clip", "openai/clip-vit-base-patch16"),
     "smolvlm-256m": ModelSpec("vlm", "HuggingFaceTB/SmolVLM-256M-Instruct"),
@@ -26,6 +32,8 @@ MODELS = {
     "resnet18": ModelSpec("timm", "resnet18.a1_in1k"),
     "dinov2-small": ModelSpec("vision", "facebook/dinov2-small"),
 }
+
+DEFAULT_MODELS = ["mobileclip2-s2", "siglip2-b16-224", "smolvlm-500m"]
 
 
 @dataclass
@@ -37,11 +45,36 @@ class Prediction:
     generated_tokens: int | None = None
 
 
+def classification_prompt(definitions: dict[str, str]) -> str:
+    descriptions = "\n".join(
+        f"{label}: {description}" for label, description in definitions.items()
+    )
+    return (
+        "Classify the visible scene using these definitions:\n"
+        + descriptions
+        + "\nChoose one best matching label. Use normal only when no defined anomaly is visible. "
+        "Use unknown when evidence is insufficient, including missing evidence of duration or ownership. "
+        'Reply only with JSON: {"label": "LABEL"}. Allowed labels: '
+        + ", ".join(definitions)
+        + ", unknown."
+    )
+
+
 def parse_vlm_response(text: str, definitions: dict[str, str]) -> Prediction:
-    """Require explicit JSON; never turn malformed output into a normal label."""
+    """Accept JSON or an exact label; ambiguous prose remains an abstention."""
     cleaned = text.strip()
     if cleaned.startswith("```") and cleaned.endswith("```"):
         cleaned = "\n".join(cleaned.splitlines()[1:-1]).strip()
+    # Accept an exact class name, without finding label words inside prose.
+    candidate = cleaned.removesuffix(".").strip()
+    if (
+        len(candidate) >= 2
+        and candidate[0] in {"'", '"'}
+        and candidate[-1] == candidate[0]
+    ):
+        candidate = candidate[1:-1].strip()
+    if candidate in definitions:
+        return Prediction(candidate, raw_response=text)
     try:
         value = json.loads(cleaned)
     except (ValueError, TypeError):
@@ -117,6 +150,102 @@ class CLIPAdapter(Adapter):
         return Prediction(max(scores, key=scores.get), 1 - scores["normal"], scores)
 
 
+class OpenCLIPAdapter(Adapter):
+    """MobileCLIP2 using the OpenCLIP port of Apple's S2 checkpoint."""
+
+    def __init__(self, spec: ModelSpec, definitions: dict[str, str], options: dict):
+        import open_clip
+        import torch
+        from timm.utils import reparameterize_model
+
+        self.torch = torch
+        self.labels = list(definitions)
+        model_name = "hf-hub:" + spec.checkpoint
+        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+            model_name,
+            device="cpu",
+            precision="fp32",
+            cache_dir=options.get("cache_dir"),
+        )
+        self.model.eval()
+        # Fuse the MobileCLIP convolution branches for inference before timing.
+        self.model = reparameterize_model(self.model, inplace=True)
+        tokenizer = open_clip.get_tokenizer(
+            model_name, cache_dir=options.get("cache_dir")
+        )
+        tokens = tokenizer(list(definitions.values()))
+        with torch.inference_mode():
+            self.text_features = self.model.encode_text(tokens, normalize=True)
+
+    def predict(self, image) -> Prediction:
+        with self.torch.inference_mode():
+            features = self.model.encode_image(
+                self.preprocess(image).unsqueeze(0), normalize=True
+            )
+            logits = self.model.logit_scale.exp() * features @ self.text_features.T
+            weights = logits.softmax(dim=-1)[0].tolist()
+        scores = dict(zip(self.labels, weights))
+        return Prediction(max(scores, key=scores.get), 1 - scores["normal"], scores)
+
+
+class SigLIPAdapter(Adapter):
+    """Cache text features and preserve SigLIP's independent sigmoid scores."""
+
+    def __init__(self, spec: ModelSpec, definitions: dict[str, str], options: dict):
+        import torch
+        from transformers import AutoModel, AutoProcessor
+
+        self.torch = torch
+        self.labels = list(definitions)
+        self.processor = AutoProcessor.from_pretrained(
+            spec.checkpoint, use_fast=False, **options
+        )
+        self.model = (
+            AutoModel.from_pretrained(
+                spec.checkpoint,
+                dtype=torch.float32,
+                attn_implementation="eager",
+                **options,
+            )
+            .to("cpu")
+            .eval()
+        )
+        tokens = self.processor(
+            text=[description.lower() for description in definitions.values()],
+            padding="max_length",
+            max_length=64,
+            truncation=True,
+            return_tensors="pt",
+        )
+        with torch.inference_mode():
+            self.text_features = torch.nn.functional.normalize(
+                self.model.get_text_features(**tokens), dim=-1
+            )
+
+    def predict(self, image) -> Prediction:
+        torch = self.torch
+        inputs = self.processor(images=image, return_tensors="pt")
+        with torch.inference_mode():
+            features = torch.nn.functional.normalize(
+                self.model.get_image_features(**inputs), dim=-1
+            )
+            logits = (
+                self.model.logit_scale.exp() * features @ self.text_features.T
+                + self.model.logit_bias
+            )[0]
+            values = logits.tolist()
+            weights = logits.sigmoid().tolist()
+        scores = dict(zip(self.labels, weights))
+        raw_scores = dict(zip(self.labels, values))
+        # Score the anomaly-vs-normal margin; sigmoid outputs do not sum to one.
+        label = max(raw_scores, key=raw_scores.get)
+        margin = (
+            max(value for name, value in raw_scores.items() if name != "normal")
+            - raw_scores["normal"]
+        )
+        return Prediction(label, margin, scores)
+
+
 class VLMAdapter(Adapter):
     def __init__(
         self,
@@ -145,18 +274,7 @@ class VLMAdapter(Adapter):
             .to("cpu")
             .eval()
         )
-        descriptions = "\n".join(
-            f"{label}: {description}" for label, description in definitions.items()
-        )
-        prompt = (
-            "Classify the visible scene using these definitions:\n"
-            + descriptions
-            + "\nChoose one best matching label. Use normal only when no defined anomaly is visible. "
-            "Use unknown when evidence is insufficient, including missing evidence of duration or ownership. "
-            'Reply only with JSON: {"label": "LABEL"}. Allowed labels: '
-            + ", ".join(definitions)
-            + ", unknown."
-        )
+        prompt = classification_prompt(definitions)
         messages = [
             {
                 "role": "user",
@@ -178,6 +296,54 @@ class VLMAdapter(Adapter):
         prediction = parse_vlm_response(text, self.definitions)
         prediction.generated_tokens = new_tokens.shape[-1]
         return prediction
+
+
+class MiniCPMAdapter(Adapter):
+    """MiniCPM-V 4.0 CPU float32 baseline, using its publisher's chat interface."""
+
+    def __init__(
+        self,
+        spec: ModelSpec,
+        definitions: dict[str, str],
+        options: dict,
+        max_new_tokens: int,
+    ):
+        import torch
+        from transformers import AutoModel, AutoProcessor
+
+        self.torch = torch
+        self.definitions = definitions
+        self.max_new_tokens = max_new_tokens
+        self.prompt = classification_prompt(definitions)
+        self.processor = AutoProcessor.from_pretrained(
+            spec.checkpoint, trust_remote_code=True, use_fast=True, **options
+        )
+        self.model = (
+            AutoModel.from_pretrained(
+                spec.checkpoint,
+                trust_remote_code=True,
+                dtype=torch.float32,
+                attn_implementation="sdpa",
+                **options,
+            )
+            .to("cpu")
+            .eval()
+        )
+
+    def predict(self, image) -> Prediction:
+        messages = [{"role": "user", "content": [image, self.prompt]}]
+        with self.torch.inference_mode():
+            text = self.model.chat(
+                msgs=messages,
+                tokenizer=self.processor.tokenizer,
+                processor=self.processor,
+                sampling=False,
+                num_beams=1,
+                repetition_penalty=1.0,
+                max_new_tokens=self.max_new_tokens,
+                max_slice_nums=1,
+            )
+        return parse_vlm_response(text, self.definitions)
 
 
 class VisionAdapter(Adapter):
@@ -278,10 +444,18 @@ def create_adapter(
 ) -> Adapter:
     spec = MODELS[name]
     options = {"local_files_only": offline}
+    if spec.revision:
+        options["revision"] = spec.revision
     if cache_dir:
         options["cache_dir"] = cache_dir
     if spec.kind == "clip":
         return CLIPAdapter(spec, definitions, options)
+    if spec.kind == "openclip":
+        return OpenCLIPAdapter(spec, definitions, options)
+    if spec.kind == "siglip":
+        return SigLIPAdapter(spec, definitions, options)
+    if spec.kind == "minicpm":
+        return MiniCPMAdapter(spec, definitions, options, max_new_tokens)
     if spec.kind == "vlm":
         return VLMAdapter(spec, definitions, options, max_new_tokens, max_side)
     return VisionAdapter(spec, definitions, options)

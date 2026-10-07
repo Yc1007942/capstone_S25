@@ -13,6 +13,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class CPUSettings:
+    """Resource limits on the host CPU; these do not emulate another processor."""
+
     threads: int = 2
     duty_cycle: float = 0.5
     max_samples_per_second: float | None = None

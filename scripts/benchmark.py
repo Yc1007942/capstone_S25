@@ -32,7 +32,7 @@ from scripts.data import (
     select_test_samples,
 )
 from scripts.metrics import detection_metrics, percentile
-from scripts.models import MODELS, create_adapter, load_image
+from scripts.models import DEFAULT_MODELS, MODELS, create_adapter, load_image
 from scripts.throttle import Throttler, add_cpu_arguments, settings_from_args
 
 
@@ -93,7 +93,12 @@ def worker(config_path: Path) -> int:
     ]
     references = [sample for sample in samples if sample.split == "reference"]
     tests = [sample for sample in samples if sample.split == "test"]
-    summary = {"model": name, "checkpoint": MODELS[name].checkpoint, "status": "error"}
+    summary = {
+        "model": name,
+        "checkpoint": MODELS[name].checkpoint,
+        "model_revision": MODELS[name].revision,
+        "status": "error",
+    }
     rows = []
     monitor = None
     started = time.perf_counter()
@@ -207,7 +212,14 @@ def worker(config_path: Path) -> int:
                 metrics=detection_metrics(rows, list(definitions)),
                 package_versions={
                     package: importlib.metadata.version(package)
-                    for package in ("torch", "transformers", "timm", "Pillow", "psutil")
+                    for package in (
+                        "torch",
+                        "transformers",
+                        "timm",
+                        "open_clip_torch",
+                        "Pillow",
+                        "psutil",
+                    )
                 },
             )
     except Exception as exc:  # noqa: BLE001 -- isolate model failures and preserve diagnostics
@@ -333,7 +345,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--models",
         nargs="+",
-        default=["clip-vit-b32", "smolvlm-256m"],
+        default=DEFAULT_MODELS,
         help="Model names, or all",
     )
     parser.add_argument("--list-models", action="store_true")
@@ -407,7 +419,7 @@ def main(argv: list[str] | None = None) -> int:
     ):
         parser.error("max-rss-mb must be positive and finite")
     try:
-        import psutil  # noqa: F401 -- validate before starting any workers
+        import psutil
 
         settings = settings_from_args(args)
         settings.configure_environment()
@@ -434,7 +446,9 @@ def main(argv: list[str] | None = None) -> int:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "python": sys.version,
             "platform": platform.platform(),
+            "cpu_model": platform.processor(),
             "logical_cpus": os.cpu_count(),
+            "total_ram_mb": psutil.virtual_memory().total / 1024**2,
             "available_cpu_cores": sorted(os.sched_getaffinity(0))
             if hasattr(os, "sched_getaffinity")
             else None,
