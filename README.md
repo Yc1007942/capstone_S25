@@ -100,6 +100,27 @@ Parallel ZIP extraction runs after transfers finish to avoid concurrent writes
 to paths that may also appear inside an archive. `--speed-mbps` is a per-file cap,
 so four workers can consume up to four times that cap in total.
 
+Drive can contain different files with identical names in the same folder.
+The fetcher stops before downloading if those files would share a local path,
+in both sequential and parallel modes. This is a filename conflict, independent
+of cookie access, quota, or worker count. To preserve every file, add:
+
+```bash
+python scripts/fetch_data.py --extract-zip --continue-on-error --use-cookies \
+  --anonymous-listing --workers 2 --request-interval 0.5 --name-conflicts rename
+```
+
+Every file in a conflicting group receives a `__drive_<FILE_ID>` suffix before
+its extension. Existing unsuffixed files are retained, and unrelated filenames
+are kept. The names are stable when listing order changes, so rerunning resumes
+the renamed paths. `download_receipt.json` records the original names, Drive IDs,
+and new paths under `renamed_files`. These copies are preserved without assuming
+that different IDs have identical contents. Image/annotation filenames that
+change will need pairing during dataset preparation before use with tools that
+match images and labels by their stems; Drive IDs alone do not establish that
+pairing. Repeated listings of the same Drive ID at the same destination are
+collapsed automatically; the same ID at different paths is retained.
+
 Rerunning resumes transfers and skips completed files. Each successfully
 downloaded ZIP is extracted even when another file fails. For a smaller retry,
 select a category with `--category`. To reduce thousands of file transfers to an

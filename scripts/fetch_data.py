@@ -67,6 +67,90 @@ def matches_patterns(path: str, patterns: list[str]) -> bool:
     )
 
 
+class DestinationConflict(ValueError):
+    """Different Drive files would overwrite the same destination."""
+
+
+@dataclass(frozen=True)
+class DriveEntry:
+    id: str
+    path: str
+    local_path: str
+
+
+def plan_download_paths(entries, name_conflicts: str):
+    """Collapse repeated ID/path entries and optionally preserve name conflicts."""
+
+    def destination_key(path):
+        return os.path.normcase(str(Path(path).resolve()))
+
+    unique = []
+    seen = set()
+    destinations = {}
+    repeated = 0
+    for entry in entries:
+        file_id = getattr(entry, "id", None)
+        if file_id is None:
+            # Without an ID, retain the entry rather than assume it is a duplicate.
+            unique.append(entry)
+            continue
+        key = destination_key(entry.local_path)
+        identity = (key, file_id)
+        if identity in seen:
+            repeated += 1
+            continue
+        seen.add(identity)
+        unique.append(entry)
+        destinations.setdefault(key, []).append(entry)
+    conflicts = {key: group for key, group in destinations.items() if len(group) > 1}
+    if conflicts and name_conflicts == "error":
+        group = next(iter(conflicts.values()))
+        links = "\n".join(
+            f"  https://drive.google.com/file/d/{entry.id}/view" for entry in group
+        )
+        raise DestinationConflict(
+            f"Different Drive file IDs share a local filename: {group[0].local_path}\n"
+            f"{links}\nUse --name-conflicts rename to download every file under a unique name. "
+            "Switching to one worker would not preserve both files at the same path."
+        )
+
+    reserved = set(destinations)
+    replacements = {}
+    renamed = []
+    # Plan independently of listing order so filenames remain stable on resume.
+    for key, group in sorted(conflicts.items()):
+        for entry in sorted(group, key=lambda entry: entry.id):
+            original = Path(entry.local_path)
+            stem = f"{original.stem}__drive_{entry.id}"
+            candidate = original.with_name(stem + original.suffix)
+            counter = 2
+            while destination_key(candidate) in reserved:
+                candidate = original.with_name(f"{stem}_{counter}{original.suffix}")
+                counter += 1
+            reserved.add(destination_key(candidate))
+            relative = PurePosixPath(entry.path.replace("\\", "/")).with_name(
+                candidate.name
+            )
+            replacement = DriveEntry(entry.id, str(relative), str(candidate))
+            replacements[(key, entry.id)] = replacement
+            renamed.append(
+                {
+                    "id": entry.id,
+                    "original_path": entry.path,
+                    "original_local_path": entry.local_path,
+                    "path": replacement.path,
+                    "local_path": replacement.local_path,
+                }
+            )
+    planned = [
+        replacements.get((destination_key(entry.local_path), entry.id), entry)
+        if getattr(entry, "id", None) is not None
+        else entry
+        for entry in unique
+    ]
+    return planned, repeated, renamed
+
+
 def download_entry(
     gdown,
     entry,
@@ -89,11 +173,9 @@ def download_entry(
     if destination.is_file():
         return str(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    # Google-native documents have no extension in the folder listing. Let
-    # gdown resolve their exported filename from the response headers.
-    download_output = (
-        str(destination) if destination.suffix else str(destination.parent) + os.sep
-    )
+    # gdown 6.4.1 resolves native-document export names during discovery. Use
+    # the exact planned path even for extensionless files and renamed conflicts.
+    download_output = str(destination)
     for attempt in range(retries + 1):
         try:
             if pacer is not None:
@@ -319,6 +401,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Concurrent file downloads (default: 1); start with 2-4 for loose images/labels",
     )
     parser.add_argument(
+        "--name-conflicts",
+        choices=("error", "rename"),
+        default="error",
+        help="Different Drive files with the same local name: stop (default) or append their Drive IDs to preserve all files",
+    )
+    parser.add_argument(
         "--max-consecutive-errors",
         type=int,
         default=5,
@@ -456,20 +544,23 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
+        entries, repeated, renamed = plan_download_paths(entries, args.name_conflicts)
+        if repeated:
+            print(
+                f"Skipped {repeated} repeated Drive listing entries (same file ID and destination).",
+                file=sys.stderr,
+            )
+        if renamed and not args.list_only:
+            print(
+                f"Renamed {len(renamed)} files with conflicting names using their Drive IDs. "
+                "The original-to-local filename mapping will be saved in download_receipt.json.",
+                file=sys.stderr,
+            )
         if args.list_only:
             for entry in entries:
                 print(entry.local_path)
             print(f"{len(entries)} files; no dataset files downloaded.")
             return 0
-        if args.workers > 1:
-            destinations = set()
-            for entry in entries:
-                destination = os.path.normcase(str(Path(entry.local_path).resolve()))
-                if destination in destinations:
-                    raise ValueError(
-                        f"Multiple Drive files map to the same local path: {entry.local_path}"
-                    )
-                destinations.add(destination)
         output.mkdir(parents=True, exist_ok=True)
         receipt = {
             "source": url,
@@ -478,6 +569,9 @@ def main(argv: list[str] | None = None) -> int:
             "listed_files": len(entries),
             "available_files": available_files,
             "include": args.include,
+            "name_conflicts": args.name_conflicts,
+            "duplicate_entries_skipped": repeated,
+            "renamed_files": renamed,
             "listing_use_cookies": listing_options["use_cookies"],
             "files": [],
             "failures": [],
@@ -615,6 +709,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         return 0
+    except DestinationConflict as exc:
+        print(
+            f"Download setup stopped: {exc}\nNo file transfers started in this run.",
+            file=sys.stderr,
+        )
+        return 1
     except (gdown.DownloadError, ValueError, OSError, zipfile.BadZipFile) as exc:
         print(
             f"Download failed: {exc}\nCheck public sharing permissions and Drive quota; rerun to resume.",

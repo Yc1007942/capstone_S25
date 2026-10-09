@@ -49,10 +49,11 @@ class ConcurrentFetchTests(unittest.TestCase):
             FileURLRetrievalError=LinkError,
             DownloadCancelled=DownloadCancelled,
         )
+        error_output = io.StringIO()
         with (
             patch.dict("sys.modules", {"gdown": fake}),
             redirect_stdout(io.StringIO()),
-            redirect_stderr(io.StringIO()),
+            redirect_stderr(error_output),
         ):
             code = fetch_data.main(
                 [
@@ -65,6 +66,7 @@ class ConcurrentFetchTests(unittest.TestCase):
                     *arguments,
                 ]
             )
+        self.last_error = error_output.getvalue()
         receipt_path = self.root / "download_receipt.json"
         receipt = (
             json.loads(receipt_path.read_text()) if receipt_path.exists() else None
@@ -275,6 +277,117 @@ class ConcurrentFetchTests(unittest.TestCase):
         download = Mock()
         code, receipt = self.run_fetch(entries, download)
         self.assertEqual(code, 1)
+        self.assertIsNone(receipt)
+        download.assert_not_called()
+        self.assertIn("Different Drive file IDs", self.last_error)
+        self.assertIn("--name-conflicts rename", self.last_error)
+        self.assertNotIn("quota", self.last_error)
+
+    def test_sequential_mode_also_rejects_distinct_files_with_the_same_name(self):
+        entries = self.entries(2)
+        entries[1].local_path = entries[0].local_path
+        # A local file must not silently count as both distinct Drive IDs.
+        Path(entries[0].local_path).write_text("previous download")
+        download = Mock()
+        code, receipt = self.run_fetch(entries, download, "--workers", "1")
+        self.assertEqual(code, 1)
+        self.assertIsNone(receipt)
+        download.assert_not_called()
+
+    def test_repeated_listing_of_the_same_id_and_path_downloads_once(self):
+        entries = self.entries(2)
+        calls = []
+
+        def download(*, id, output, **options):
+            calls.append(id)
+            Path(output).write_text(id)
+            return output
+
+        code, receipt = self.run_fetch([entries[0], entries[0], entries[1]], download)
+        self.assertEqual(code, 0)
+        self.assertCountEqual(calls, ["0", "1"])
+        self.assertEqual(receipt["available_files"], 3)
+        self.assertEqual(receipt["listed_files"], 2)
+        self.assertEqual(receipt["duplicate_entries_skipped"], 1)
+        self.assertEqual(len(receipt["files"]), 2)
+
+    def test_the_same_drive_id_at_different_paths_is_preserved(self):
+        entries = self.entries(2)
+        entries[1].id = entries[0].id
+
+        def download(*, id, output, **options):
+            Path(output).write_text(id)
+            return output
+
+        code, receipt = self.run_fetch(entries, download)
+        self.assertEqual(code, 0)
+        self.assertEqual(receipt["duplicate_entries_skipped"], 0)
+        self.assertCountEqual(receipt["files"], [entry.local_path for entry in entries])
+
+    def test_renaming_preserves_both_files_and_resumes_when_listing_order_changes(self):
+        for filename in ("same.jpg", "README"):
+            with self.subTest(filename=filename):
+                entries = self.entries(2)
+                original = self.root / filename
+                original.write_text("previous download with unknown Drive ID")
+                for entry in entries:
+                    entry.path = filename
+                    entry.local_path = str(original)
+
+                def download(*, id, output, **options):
+                    Path(output).write_text(id)
+                    return output
+
+                code, receipt = self.run_fetch(
+                    entries, download, "--name-conflicts", "rename"
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(
+                    original.read_text(), "previous download with unknown Drive ID"
+                )
+                self.assertEqual(receipt["name_conflicts"], "rename")
+                self.assertEqual(len(receipt["renamed_files"]), 2)
+                for mapping in receipt["renamed_files"]:
+                    self.assertEqual(mapping["original_path"], filename)
+                    self.assertIn(f"__drive_{mapping['id']}", mapping["local_path"])
+                    self.assertEqual(
+                        Path(mapping["local_path"]).read_text(), mapping["id"]
+                    )
+                initial_mapping = receipt["renamed_files"]
+                download = Mock()
+                code, receipt = self.run_fetch(
+                    list(reversed(entries)), download, "--name-conflicts", "rename"
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(receipt["renamed_files"], initial_mapping)
+                self.assertEqual(receipt["skipped_existing"], 2)
+                download.assert_not_called()
+
+    def test_renamed_paths_do_not_collide_with_another_remote_filename(self):
+        entries = self.entries(3)
+        entries[1].path = entries[0].path
+        entries[1].local_path = entries[0].local_path
+        entries[2].path = "0__drive_0.txt"
+        entries[2].local_path = str(self.root / entries[2].path)
+
+        def download(*, id, output, **options):
+            Path(output).write_text(id)
+            return output
+
+        code, receipt = self.run_fetch(entries, download, "--name-conflicts", "rename")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(set(receipt["files"])), 3)
+        self.assertEqual((self.root / "0__drive_0.txt").read_text(), "2")
+        self.assertEqual((self.root / "0__drive_0_2.txt").read_text(), "0")
+
+    def test_rename_preview_lists_unique_paths_without_downloading(self):
+        entries = self.entries(2)
+        entries[1].local_path = entries[0].local_path
+        download = Mock()
+        code, receipt = self.run_fetch(
+            entries, download, "--list-only", "--name-conflicts", "rename"
+        )
+        self.assertEqual(code, 0)
         self.assertIsNone(receipt)
         download.assert_not_called()
 
