@@ -62,11 +62,43 @@ default); it does not guarantee that Google will allow the requests. gdown may
 make several HTTP requests inside an attempt. `--speed-mbps` limits bandwidth,
 which is separate from request pacing.
 The minimum interval is `0`, which disables the script's added delay; `0.01`
-means a minimum of 10 milliseconds between attempt starts. Transfers remain
-sequential, and an attempt that already takes longer than the interval adds no
-extra sleep. There is no guaranteed throttle-free interval for Drive. Start
-with the default one second after repeated failures and adjust based on successful
-downloads. Downloading a ZIP avoids thousands of individual-file requests.
+means a minimum of 10 milliseconds between attempt starts. Transfers are
+sequential by default; with one worker, an attempt that already takes longer
+than the interval adds no extra sleep. There is no guaranteed throttle-free
+interval for Drive. Start with the default one second after repeated failures and
+adjust based on successful downloads. Downloading a ZIP avoids thousands of
+individual-file requests.
+
+For thousands of loose images and annotation files, use concurrent downloads:
+
+```bash
+python scripts/fetch_data.py --extract-zip --continue-on-error --use-cookies \
+  --anonymous-listing --workers 4 --request-interval 0.5
+```
+
+In PowerShell, use the same command on one line. `--workers 4` allows up to four
+file transfers at once. Start with two workers after repeated access failures;
+increase to four if downloads succeed. The request interval is shared across all
+workers and retries: `0.5` allows at most two attempt starts per second, while
+transfers overlap. `--request-interval 0` disables pacing and requests new files
+as soon as a worker is available. More workers or less delay can increase Drive
+errors; concurrency does not bypass quota or access restrictions.
+
+This overlaps separate files; it does not split one file into simultaneous range
+downloads. For the many tiny label files, individual HTTP setup is a substantial
+cost, so an existing dataset ZIP or downloading a folder as a ZIP in the Drive
+browser is often the better way to reduce requests. There is no server-side batch
+ZIP creation in this script. Folder discovery still runs before file transfers.
+
+Each parallel worker uses a private temporary copy of the cookie file, removed
+when the workers stop, so transfers do not write to the original cookie cache.
+Completed files are still skipped and partial files resumed. Only a worker-sized
+set of transfers is scheduled at a time. The failure limit stops scheduling new
+files and requests cancellation of running transfers; files that finish during
+the stop are recorded. Ctrl+C also cancels transfers and saves the receipt.
+Parallel ZIP extraction runs after transfers finish to avoid concurrent writes
+to paths that may also appear inside an archive. `--speed-mbps` is a per-file cap,
+so four workers can consume up to four times that cap in total.
 
 Rerunning resumes transfers and skips completed files. Each successfully
 downloaded ZIP is extracted even when another file fails. For a smaller retry,
