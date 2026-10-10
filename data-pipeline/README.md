@@ -1,77 +1,84 @@
-# Data pipeline
+﻿# Data pipeline
 
-Data pipeline scaffold for YOLO-VLM anomaly detection. This directory is a
-separate uv project with its own `pyproject.toml`, `uv.lock`, and `.venv`.
-Python 3.12 is selected by `.python-version`.
+A Python project for the YOLO-VLM anomaly detection pipeline.
 
-## Install uv
+## First-time setup
 
-On Windows, run in PowerShell:
+### 1. Install uv
 
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+uv installs the Python version and packages this project needs.
 
-On macOS or Linux:
+**macOS/Linux:**
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Open a new terminal after installation and check:
-
-```bash
-uv --version
-```
-
-See the official [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
-for alternative installation methods.
-
-## Initialize the environment
-
-Clone this repository if needed, then open a terminal in `data-pipeline`.
-If your terminal starts in the repository root, run `cd data-pipeline` first.
-All commands below run from the `data-pipeline` directory:
-
-```bash
-uv python install 3.12
-uv sync --locked
-uv run main.py
-```
-
-`uv sync --locked` creates the local environment and installs dependencies from
-the committed lockfile. `uv run` uses that environment without manual activation.
-The current entry point prints `Hello from data-pipeline!`; the project currently
-declares no runtime dependencies. Ruff is installed as a development dependency.
-
-### Optional environment activation
-
-You can run commands with `uv run` without activating the environment. To use
-`python` directly, activate it in PowerShell:
+**Windows (PowerShell):**
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
+powershell -ExecutionPolicy Bypass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-On macOS or Linux:
+Close and reopen your terminal, then run `uv --version` to check the installation.
+See the [uv installation guide](https://docs.astral.sh/uv/getting-started/installation/)
+for other installation options.
+
+### 2. Install Python and dependencies
 
 ```bash
-source .venv/bin/activate
+cd data-pipeline
+uv python install 3.12
+uv sync --locked
 ```
 
-Run `deactivate` when finished. If PowerShell blocks activation, use
-`uv run main.py` or `.\.venv\Scripts\python.exe main.py` instead.
+Use `uv run` before Python commands to use this environment; no manual
+activation is needed. Run `uv sync --locked` again after pulling changes that
+update dependencies.
 
 ## Add dependencies
 
-Run these commands inside `data-pipeline`, replacing `package-name` with the
-package you need:
+To add a production package:
 
 ```bash
-uv add package-name
-# For development tools:
-uv add --dev package-name
+uv add <package-name>
 ```
 
-Commit both `pyproject.toml` and `uv.lock` after changing dependencies so other
-contributors can recreate the environment with `uv sync --locked`.
+To add a development package:
+
+```bash
+uv add --dev <package-name>
+```
+
+Commit both `pyproject.toml` and `uv.lock` after changing dependencies.
+
+## Linting and formatting
+
+Linting and formatting are executed when save file is executed. To make changes from the terminal:
+
+```bash
+uv run ruff check --fix .
+uv run ruff format .
+```
+
+## Testing
+
+Run the test suite with:
+
+```bash
+uv run pytest
+```
+
+To run a single test file:
+
+```bash
+uv run pytest tests/test_recording_worker.py
+```
+
+To see which parts of the pipeline were exercised by tests:
+
+```bash
+uv run pytest --cov=video_ingestion --cov-report=term-missing
+```
+
+Tests live in `tests/`, with filenames starting with `test_`.
