@@ -1,0 +1,53 @@
+name: Data pipeline CI
+
+on:
+  push:
+    paths:
+      - "data-pipeline/**"
+      - ".github/workflows/data-pipeline-ci.yml"
+  pull_request:
+    paths:
+      - "data-pipeline/**"
+      - ".github/workflows/data-pipeline-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Data pipeline / ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - check: lint
+            command: ruff check .
+          - check: format
+            command: ruff format --check .
+          - check: tests
+            command: pytest --cov=video_ingestion --cov-report=term-missing
+
+    defaults:
+      run:
+        working-directory: data-pipeline
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.13.0"
+
+      - name: Install Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --locked --dev
+
+      - name: Run ${{ matrix.check }}
+        run: uv run --locked ${{ matrix.command }}
