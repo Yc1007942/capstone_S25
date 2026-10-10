@@ -1,0 +1,32 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Python: lint",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/ruff",
+      "windows": { "command": "${workspaceFolder}/.venv/Scripts/ruff.exe" },
+      "args": ["check", "."],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Python: format",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/ruff",
+      "windows": { "command": "${workspaceFolder}/.venv/Scripts/ruff.exe" },
+      "args": ["format", "."],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Python: fix lint",
+      "type": "process",
+      "command": "${workspaceFolder}/.venv/bin/ruff",
+      "windows": { "command": "${workspaceFolder}/.venv/Scripts/ruff.exe" },
+      "args": ["check", "--fix", "."],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}
