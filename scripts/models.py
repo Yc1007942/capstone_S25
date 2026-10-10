@@ -434,6 +434,48 @@ class VisionAdapter(Adapter):
         return Prediction(max(scores, key=scores.get), anomaly_score, scores)
 
 
+class VadCLIPAdapter(Adapter):
+    """Documented stub for a temporal video anomaly detector -- NOT runnable here.
+
+    VadCLIP (and the UCF-Crime / XD-Violence detectors in its family) is trained to score
+    *frame sequences* against a fixed set of crime/violence classes, using an upstream
+    feature pipeline (I3D / SlowFast-style 3D-conv or optical-flow features) that this CPU
+    harness does not reproduce. Two things make it unsuitable for the single-frame anomaly
+    benchmark in ``scripts/benchmark.py``:
+
+    * **Modality.** It consumes a clip of frames and emits one score per video; our manifest
+      is image-level, so there is no temporal input to feed it. Loitering and unattended items
+      are inherently temporal behaviours that a single still cannot confirm.
+    * **Taxonomy.** Its labels (e.g. ``abuse``, ``arson``, ``road_accidents``) do not include
+      this project's anomalies -- smoking, littering, rough sleeping, loitering, unattended
+      items -- so even a valid run would have no ground-truth class to score against.
+
+    This stub exists only to mark where such a model would plug in and to keep the integration
+    steps explicit. It is intentionally absent from :data:`MODELS` and not dispatched by
+    :func:`create_adapter`, so ``benchmark.py --list-models`` never offers it.
+
+    To add real support later:
+      1. Vendor the upstream repo + a checkpoint trained on UCF-Crime or XD-Violence.
+      2. Build a clip sampler that groups consecutive frames by ``group_id`` (camera/date) from
+         the manifest, since loitering / unattended items are temporal behaviours.
+      3. Map its output score onto :class:`Prediction.anomaly_score` and treat "any crime" as the
+         positive class; re-derive labels for a matching taxonomy first.
+      4. Run it through ``scripts/vadclip.py`` (a separate video pipeline), not this harness,
+         because it needs its own feature extractor and is GPU-preferred.
+    """
+
+    def __init__(self, spec: ModelSpec, definitions: dict[str, str], options: dict):
+        raise NotImplementedError(
+            "VadCLIP is a temporal video detector whose UCF-Crime/XD-Violence taxonomy does not "
+            "cover this project's anomalies and which needs its own feature pipeline; it cannot be "
+            "scored on the single-frame manifest. See the class docstring for integration steps, or "
+            "use scripts/vadclip.py."
+        )
+
+    def predict(self, image) -> Prediction:  # pragma: no cover -- documentation-only stub
+        raise NotImplementedError("VadCLIPAdapter is a documentation-only stub.")
+
+
 def create_adapter(
     name: str,
     definitions: dict[str, str],
